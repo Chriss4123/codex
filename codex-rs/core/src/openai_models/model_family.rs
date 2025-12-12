@@ -332,7 +332,7 @@ pub(in crate::openai_models) fn find_family_for_model(slug: &str) -> ModelFamily
             default_verbosity: Some(Verbosity::Low),
             base_instructions: GPT_5_2_INSTRUCTIONS.to_string(),
             default_reasoning_effort: Some(ReasoningEffort::Medium),
-            truncation_policy: TruncationPolicy::Bytes(10_000),
+            truncation_policy: TruncationPolicy::Tokens(10_000),
             shell_type: ConfigShellToolType::ShellCommand,
             supports_parallel_tool_calls: true,
             context_window: Some(CONTEXT_WINDOW_272K),
