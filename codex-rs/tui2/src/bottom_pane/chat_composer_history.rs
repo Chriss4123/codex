@@ -4,6 +4,28 @@ use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use codex_core::protocol::Op;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryEntry {
+    pub(crate) text: String,
+    pub(crate) pending_pastes: Vec<(String, String)>,
+}
+
+impl HistoryEntry {
+    pub(crate) fn new(text: String) -> Self {
+        Self {
+            text,
+            pending_pastes: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_pending(text: String, pending_pastes: Vec<(String, String)>) -> Self {
+        Self {
+            text,
+            pending_pastes,
+        }
+    }
+}
+
 /// State machine that manages shell-style history navigation (Up/Down) inside
 /// the chat composer. This struct is intentionally decoupled from the
 /// rendering widget so the logic remains isolated and easier to test.
@@ -15,10 +37,10 @@ pub(crate) struct ChatComposerHistory {
     history_entry_count: usize,
 
     /// Messages submitted by the user *during this UI session* (newest at END).
-    local_history: Vec<String>,
+    local_history: Vec<HistoryEntry>,
 
     /// Cache of persistent history entries fetched on-demand.
-    fetched_history: HashMap<usize, String>,
+    fetched_history: HashMap<usize, HistoryEntry>,
 
     /// Current cursor within the combined (persistent + local) history. `None`
     /// indicates the user is *not* currently browsing history.
@@ -55,19 +77,22 @@ impl ChatComposerHistory {
     /// Record a message submitted by the user in the current session so it can
     /// be recalled later.
     pub fn record_local_submission(&mut self, text: &str) {
-        if text.is_empty() {
+        self.record_local_submission_entry(HistoryEntry::new(text.to_string()));
+    }
+
+    pub fn record_local_submission_entry(&mut self, entry: HistoryEntry) {
+        if entry.text.is_empty() {
             return;
         }
-
         self.history_cursor = None;
         self.last_history_text = None;
 
         // Avoid inserting a duplicate if identical to the previous entry.
-        if self.local_history.last().is_some_and(|prev| prev == text) {
+        if self.local_history.last().is_some_and(|prev| prev == &entry) {
             return;
         }
 
-        self.local_history.push(text.to_string());
+        self.local_history.push(entry);
     }
 
     /// Reset navigation tracking so the next Up key resumes from the latest entry.
@@ -99,7 +124,7 @@ impl ChatComposerHistory {
 
     /// Handle <Up>. Returns true when the key was consumed and the caller
     /// should request a redraw.
-    pub fn navigate_up(&mut self, app_event_tx: &AppEventSender) -> Option<String> {
+    pub fn navigate_up(&mut self, app_event_tx: &AppEventSender) -> Option<HistoryEntry> {
         let total_entries = self.history_entry_count + self.local_history.len();
         if total_entries == 0 {
             return None;
@@ -116,7 +141,7 @@ impl ChatComposerHistory {
     }
 
     /// Handle <Down>.
-    pub fn navigate_down(&mut self, app_event_tx: &AppEventSender) -> Option<String> {
+    pub fn navigate_down(&mut self, app_event_tx: &AppEventSender) -> Option<HistoryEntry> {
         let total_entries = self.history_entry_count + self.local_history.len();
         if total_entries == 0 {
             return None;
@@ -137,7 +162,7 @@ impl ChatComposerHistory {
                 // Past newest – clear and exit browsing mode.
                 self.history_cursor = None;
                 self.last_history_text = None;
-                Some(String::new())
+                Some(HistoryEntry::new(String::new()))
             }
         }
     }
@@ -148,16 +173,16 @@ impl ChatComposerHistory {
         log_id: u64,
         offset: usize,
         entry: Option<String>,
-    ) -> Option<String> {
+    ) -> Option<HistoryEntry> {
         if self.history_log_id != Some(log_id) {
             return None;
         }
-        let text = entry?;
-        self.fetched_history.insert(offset, text.clone());
+        let entry = HistoryEntry::new(entry?);
+        self.fetched_history.insert(offset, entry.clone());
 
         if self.history_cursor == Some(offset as isize) {
-            self.last_history_text = Some(text.clone());
-            return Some(text);
+            self.last_history_text = Some(entry.text.clone());
+            return Some(entry);
         }
         None
     }
@@ -170,19 +195,19 @@ impl ChatComposerHistory {
         &mut self,
         global_idx: usize,
         app_event_tx: &AppEventSender,
-    ) -> Option<String> {
+    ) -> Option<HistoryEntry> {
         if global_idx >= self.history_entry_count {
             // Local entry.
-            if let Some(text) = self
+            if let Some(entry) = self
                 .local_history
                 .get(global_idx - self.history_entry_count)
             {
-                self.last_history_text = Some(text.clone());
-                return Some(text.clone());
+                self.last_history_text = Some(entry.text.clone());
+                return Some(entry.clone());
             }
-        } else if let Some(text) = self.fetched_history.get(&global_idx) {
-            self.last_history_text = Some(text.clone());
-            return Some(text.clone());
+        } else if let Some(entry) = self.fetched_history.get(&global_idx) {
+            self.last_history_text = Some(entry.text.clone());
+            return Some(entry.clone());
         } else if let Some(log_id) = self.history_log_id {
             let op = Op::GetHistoryEntryRequest {
                 offset: global_idx,
@@ -199,6 +224,7 @@ mod tests {
     use super::*;
     use crate::app_event::AppEvent;
     use codex_core::protocol::Op;
+    use pretty_assertions::assert_eq;
     use tokio::sync::mpsc::unbounded_channel;
 
     #[test]
@@ -212,7 +238,10 @@ mod tests {
         // First entry is recorded.
         history.record_local_submission("hello");
         assert_eq!(history.local_history.len(), 1);
-        assert_eq!(history.local_history.last().unwrap(), "hello");
+        assert_eq!(
+            history.local_history.last().unwrap(),
+            &HistoryEntry::new("hello".to_string())
+        );
 
         // Identical consecutive entry is skipped.
         history.record_local_submission("hello");
@@ -221,7 +250,10 @@ mod tests {
         // Different entry is recorded.
         history.record_local_submission("world");
         assert_eq!(history.local_history.len(), 2);
-        assert_eq!(history.local_history.last().unwrap(), "world");
+        assert_eq!(
+            history.local_history.last().unwrap(),
+            &HistoryEntry::new("world".to_string())
+        );
     }
 
     #[test]
@@ -252,7 +284,7 @@ mod tests {
 
         // Inject the async response.
         assert_eq!(
-            Some("latest".into()),
+            Some(HistoryEntry::new("latest".to_string())),
             history.on_entry_response(1, 2, Some("latest".into()))
         );
 
@@ -273,7 +305,7 @@ mod tests {
         );
 
         assert_eq!(
-            Some("older".into()),
+            Some(HistoryEntry::new("older".to_string())),
             history.on_entry_response(1, 1, Some("older".into()))
         );
     }
@@ -285,16 +317,29 @@ mod tests {
 
         let mut history = ChatComposerHistory::new();
         history.set_metadata(1, 3);
-        history.fetched_history.insert(1, "command2".into());
-        history.fetched_history.insert(2, "command3".into());
+        history
+            .fetched_history
+            .insert(1, HistoryEntry::new("command2".to_string()));
+        history
+            .fetched_history
+            .insert(2, HistoryEntry::new("command3".to_string()));
 
-        assert_eq!(Some("command3".into()), history.navigate_up(&tx));
-        assert_eq!(Some("command2".into()), history.navigate_up(&tx));
+        assert_eq!(
+            Some(HistoryEntry::new("command3".to_string())),
+            history.navigate_up(&tx)
+        );
+        assert_eq!(
+            Some(HistoryEntry::new("command2".to_string())),
+            history.navigate_up(&tx)
+        );
 
         history.reset_navigation();
         assert!(history.history_cursor.is_none());
         assert!(history.last_history_text.is_none());
 
-        assert_eq!(Some("command3".into()), history.navigate_up(&tx));
+        assert_eq!(
+            Some(HistoryEntry::new("command3".to_string())),
+            history.navigate_up(&tx)
+        );
     }
 }

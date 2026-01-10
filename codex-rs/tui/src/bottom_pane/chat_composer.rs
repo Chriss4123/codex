@@ -17,6 +17,7 @@ use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::WidgetRef;
 
 use super::chat_composer_history::ChatComposerHistory;
+use super::chat_composer_history::HistoryEntry;
 use super::command_popup::CommandItem;
 use super::command_popup::CommandPopup;
 use super::file_search_popup::FileSearchPopup;
@@ -59,6 +60,7 @@ use crate::ui_consts::LIVE_PREFIX_COLS;
 use codex_core::skills::model::SkillMetadata;
 use codex_file_search::FileMatch;
 use std::cell::RefCell;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -113,6 +115,7 @@ pub(crate) struct ChatComposer {
     dismissed_file_popup_token: Option<String>,
     current_file_query: Option<String>,
     pending_pastes: Vec<(String, String)>,
+    // Monotonic per-size counters; kept across draft restore so placeholders never collide.
     large_paste_counters: HashMap<usize, usize>,
     has_focus: bool,
     attached_images: Vec<AttachedImage>,
@@ -243,10 +246,10 @@ impl ChatComposer {
         offset: usize,
         entry: Option<String>,
     ) -> bool {
-        let Some(text) = self.history.on_entry_response(log_id, offset, entry) else {
+        let Some(entry) = self.history.on_entry_response(log_id, offset, entry) else {
             return false;
         };
-        self.set_text_content(text);
+        self.apply_history_entry(entry);
         true
     }
 
@@ -377,6 +380,42 @@ impl ChatComposer {
         text
     }
 
+    fn pending_paste_occurrences(
+        text: &str,
+        pending_pastes: &[(String, String)],
+    ) -> Vec<(usize, String)> {
+        let mut unique_placeholders = Vec::new();
+        let mut seen = HashSet::new();
+        for (placeholder, _) in pending_pastes {
+            if seen.insert(placeholder.as_str()) {
+                unique_placeholders.push(placeholder.as_str());
+            }
+        }
+        unique_placeholders.sort_by_key(|placeholder| Reverse(placeholder.len()));
+
+        let mut occurrences = Vec::new();
+        let mut idx = 0usize;
+        while idx < text.len() {
+            let slice = &text[idx..];
+            let mut matched = None;
+            for placeholder in &unique_placeholders {
+                if slice.starts_with(placeholder) {
+                    matched = Some(*placeholder);
+                    break;
+                }
+            }
+            if let Some(placeholder) = matched {
+                occurrences.push((idx, placeholder.to_string()));
+                idx = idx.saturating_add(placeholder.len());
+            } else if let Some(ch) = slice.chars().next() {
+                idx = idx.saturating_add(ch.len_utf8());
+            } else {
+                break;
+            }
+        }
+        occurrences
+    }
+
     /// Override the footer hint items displayed beneath the composer. Passing
     /// `None` restores the default shortcut footer.
     pub(crate) fn set_footer_hint_override(&mut self, items: Option<Vec<(String, String)>>) {
@@ -394,20 +433,82 @@ impl ChatComposer {
         self.sync_popups();
     }
 
+    pub(crate) fn set_text_content_with_pending(
+        &mut self,
+        text: String,
+        pending_pastes: Vec<(String, String)>,
+    ) {
+        // Clear any existing content, placeholders, and attachments first.
+        self.textarea.set_text("");
+        self.pending_pastes.clear();
+        self.attached_images.clear();
+
+        if pending_pastes.is_empty() {
+            self.textarea.set_text(&text);
+            self.textarea.set_cursor(0);
+            self.sync_popups();
+            return;
+        }
+
+        let occurrences = Self::pending_paste_occurrences(&text, &pending_pastes);
+        if occurrences.is_empty() {
+            self.textarea.set_text(&text);
+            self.textarea.set_cursor(0);
+            self.sync_popups();
+            return;
+        }
+
+        let found: HashSet<String> = occurrences
+            .iter()
+            .map(|(_, placeholder)| placeholder.clone())
+            .collect();
+        let kept = pending_pastes
+            .into_iter()
+            .filter(|(placeholder, _)| found.contains(placeholder.as_str()))
+            .collect::<Vec<_>>();
+
+        let mut idx = 0usize;
+        for (pos, placeholder) in occurrences {
+            if pos > idx {
+                self.textarea.insert_str(&text[idx..pos]);
+            }
+            self.textarea.insert_element(&placeholder);
+            idx = pos.saturating_add(placeholder.len());
+        }
+        if idx < text.len() {
+            self.textarea.insert_str(&text[idx..]);
+        }
+
+        self.pending_pastes = kept;
+        self.textarea.set_cursor(0);
+        self.sync_popups();
+    }
+
     pub(crate) fn clear_for_ctrl_c(&mut self) -> Option<String> {
         if self.is_empty() {
             return None;
         }
         let previous = self.current_text();
+        let pending_pastes = std::mem::take(&mut self.pending_pastes);
         self.set_text_content(String::new());
         self.history.reset_navigation();
-        self.history.record_local_submission(&previous);
+        let entry = HistoryEntry::with_pending(previous, pending_pastes);
+        let previous = entry.text.clone();
+        self.history.record_local_submission_entry(entry);
         Some(previous)
     }
 
     /// Get the current composer text.
     pub(crate) fn current_text(&self) -> String {
         self.textarea.text().to_string()
+    }
+
+    fn apply_history_entry(&mut self, entry: HistoryEntry) {
+        if entry.pending_pastes.is_empty() {
+            self.set_text_content(entry.text);
+        } else {
+            self.set_text_content_with_pending(entry.text, entry.pending_pastes);
+        }
     }
 
     /// Attempt to start a burst by retro-capturing recent chars before the cursor.
@@ -1192,7 +1293,7 @@ impl ChatComposer {
                         _ => unreachable!(),
                     };
                     if let Some(text) = replace_text {
-                        self.set_text_content(text);
+                        self.apply_history_entry(text);
                         return (InputResult::None, true);
                     }
                 }
@@ -2215,8 +2316,51 @@ mod tests {
 
         assert_eq!(
             composer.history.navigate_up(&composer.app_event_tx),
-            Some("draft text".to_string())
+            Some(HistoryEntry::new("draft text".to_string()))
         );
+    }
+
+    #[test]
+    fn clear_for_ctrl_c_preserves_pending_paste_history_entry() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        let large = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 5);
+        composer.handle_paste(large.clone());
+        let char_count = large.chars().count();
+        let placeholder = format!("[Pasted Content {char_count} chars]");
+        assert_eq!(composer.textarea.text(), placeholder);
+        assert_eq!(
+            composer.pending_pastes,
+            vec![(placeholder.clone(), large.clone())]
+        );
+
+        composer.clear_for_ctrl_c();
+        assert!(composer.is_empty());
+
+        let history_entry = composer
+            .history
+            .navigate_up(&composer.app_event_tx)
+            .expect("expected history entry");
+        assert_eq!(
+            history_entry,
+            HistoryEntry::with_pending(
+                placeholder.clone(),
+                vec![(placeholder.clone(), large.clone())]
+            )
+        );
+
+        composer.apply_history_entry(history_entry);
+        assert_eq!(composer.textarea.text(), placeholder);
+        assert_eq!(composer.pending_pastes, vec![(placeholder.clone(), large)]);
+        assert_eq!(composer.textarea.element_payloads(), vec![placeholder]);
     }
 
     #[test]
